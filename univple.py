@@ -1,18 +1,24 @@
 # Universal pleasantness project from Majid lab
 
+from copy import copy
+import joblib
+from matplotlib import lines, cm, colors
 import matplotlib.pyplot as plt
 import numpy as np
 import os
 import pandas as pd
+import pathlib
 from pathlib import Path
 import pickle
+import pingouin as pg
 import platform
 import pyrfume
 import pystan
-from scipy.stats import norm, kstest
+from scipy.stats import norm, kendalltau, kstest
 import seaborn as sns
 from sklearn.decomposition import PCA
 from sklearn.manifold import MDS
+from tqdm.auto import tqdm, trange
 import warnings
 from wurlitzer import sys_pipes
 os.environ['NUMEXPR_MAX_THREADS'] = '8'
@@ -21,7 +27,7 @@ N_SUBJECTS = 283
 
 
 def load_data(by='odor'):
-    data = pyrfume.load_data('mainland_unpub/UniversalPleasantness/Universal Pleasantness.csv')
+    data = pd.read_csv('data/Universal Pleasantness.csv')
     data = data.set_index(['Group', 'Participant', 'OdorName']).unstack('OdorName')['Ranking'].astype(int)
     odorants = list(data)
     if by=='ranks':
@@ -30,13 +36,28 @@ def load_data(by='odor'):
     return data, odorants
 
 
-def shuffle_data(data, groups, how='within-group'):
+def shuffle_data(data, groups, how, random_state=0):
     # Shuffle ranks within each group.
-    # A unique shuffle is generated for each group, but all individuals within a group get the same shuffle
-    n_odorants = data.shape[1]
-    shuffles = [np.argsort(np.random.randn(n_odorants)) for i in range(len(groups))]
-    data_sh = data.apply(lambda x: x[shuffles[groups.index(x.name[0])]].reset_index(drop=True), axis=1)
-    data_sh.columns = data.columns
+    # A unique shuffle is generated for each culture, but all individuals within a group get the same shuffle
+    n_individuals, n_odorants = data.shape
+    n_groups = len(groups)
+    data_sh = data.copy()
+    if how == 'odors-within-culture':
+        for i, group in enumerate(groups):
+            group_index = data.index.get_level_values('Group') == group
+            data_sh.loc[group_index] = data.loc[group_index].sample(frac=1, replace=False, axis=1, random_state=random_state+i).values
+        #data_sh.index = data.index
+        #shuffles = [np.argsort(np.random.randn(n_odorants)) for i in range(len(groups))]
+        #data_sh = data.apply(lambda x: x[shuffles[groups.index(x.name[0])]].reset_index(drop=True), axis=1)
+        #data_sh.columns = data.columns
+    elif how == 'individuals':
+        data_sh[:] = data.sample(frac=1, replace=False, random_state=random_state).values
+        #data_sh.index = data.index
+    elif how == 'odors':
+        data_sh[:] = data.sample(frac=1, replace=False, random_state=random_state, axis=1).values
+        #data_sh.index = data.index
+    else:
+        raise Exception(f"No such shuffle method: {how}")
     return data_sh
 
 
@@ -131,6 +152,17 @@ def fit_model(model, d, warmup=5000, iter=20000):
     samples = fit.to_dataframe()
     
     return fit, samples
+
+
+def load_or_sample(model, data, name, use_cache=True, warmup=5000, iter=20000):
+    name = 'samples_%s_%s_%s' % (name, joblib.hash(model), joblib.hash(data))
+    path = pathlib.Path(name)
+    if path.exists() and use_cache:
+        samples = pd.read_csv(path)
+    else:
+        fit, samples = fit_model(model, data, warmup=warmup, iter=iter)
+        samples.to_csv(path.name) # Save the fitted samples
+    return samples
         
     
 def plot_global_agreement(samples, odorants):
@@ -402,3 +434,169 @@ def plot_ind_corrs(data, samples, groups, odorants):
             ks, p = kstest(x, 'norm', args=(z_mean, z_se))
             ax.set_title('%s (p=%.3g)' % (group, p))
     plt.tight_layout();
+
+    
+def compute_kendall_taus(raw_data, model_predictions):
+    """Compute Kendall-Tau correlation for ranks between individuals, and between model predictions and individuals."""
+    taus = pd.DataFrame(index=raw_data.index, columns=raw_data.index)
+    for individual1 in tqdm(taus.index):
+        for individual2 in taus.columns.drop(individual1):
+            x = raw_data.loc[individual1]
+            y = raw_data.loc[individual2]
+            taus.loc[individual1, individual2] = kendalltau(x, y)[0]
+    taus.loc[('Model', 1), :] = raw_data.apply(lambda x: kendalltau(model_predictions, x)[0], axis=1)
+    return taus
+
+
+def fig_kendall_tau(taus, groups):
+    tau_stats = pd.DataFrame(index=groups)
+    for group in groups:
+        group_data = taus.loc[group]
+        n = group_data.shape[0]
+        tau_stats.loc[group, 'Culture'] = group_data[group].mean().mean()
+        tau_stats.loc[group, 'Culture_sem'] = group_data[group].std().mean() / np.sqrt(n)
+        tau_stats.loc[group, 'Universal'] = group_data.mean().mean()
+        tau_stats.loc[group, 'Universal_sem'] = group_data.std().mean() / np.sqrt(n)
+        tau_stats.loc[group, 'Model'] = taus.loc['Model', group].mean().mean()
+        # Model is the same for every group
+        tau_stats.loc[group, 'Model_sem'] = 0#taus.loc['Model', group].std().mean() / np.sqrt(n)
+
+    sns.set(font_scale=1.4)
+    sns.set_style('whitegrid')
+    fig, ax = plt.subplots(1, 2, figsize=(16, 7))
+    cmap = cm.get_cmap('jet')
+    norm = colors.Normalize(vmin=0, vmax=len(groups)-1)
+    for i, group in enumerate(groups):
+        tau_stats.loc[[group]].plot.scatter(x='Culture', y='Universal', xerr='Culture_sem', yerr='Universal_sem',
+                                             color=cmap(norm(i)), label=group, ax=ax[0])
+    ax[0].plot([0, 1], [0, 1], '--')
+    ax[0].set_xlim(0, 0.6)
+    ax[0].set_ylim(0, 0.6)
+    ax[0].legend(loc=4, fontsize=11)
+    ax[0].set_title('Correlation between individual and...')
+    for i, group in enumerate(groups):
+        tau_stats.loc[[group]].plot.scatter(x='Culture', y='Model', xerr='Culture_sem', yerr='Model_sem',
+                                             color=cmap(norm(i)), label=group, ax=ax[1])
+    ax[1].plot([0, 1], [0, 1], '--')
+    ax[1].set_xlim(0, 0.6)
+    ax[1].set_ylim(0, 0.6)
+    ax[1].legend(loc=4, fontsize=11)
+    ax[1].set_title('Correlation between individual and...')
+    
+    
+def fig_highest_lowest(ranked_data, groups, odorants):
+    fig, ax = plt.subplots(2, 2, sharex=True, figsize=(15, 8))
+    firsts = pd.DataFrame(index=range(1, 11), columns=groups)
+    lasts = pd.DataFrame(index=range(1, 11), columns=groups)
+    for group in groups:
+        firsts[group] = ranked_data.loc[group, '1st'].value_counts()
+        lasts[group] = ranked_data.loc[group, '10th'].value_counts()
+    firsts = firsts.fillna(0)
+    lasts = lasts.fillna(0)
+    cmap = copy(cm.get_cmap('Reds'))
+    cmap.set_bad('white')
+    sns.heatmap(firsts / firsts.sum(), cmap=cmap, ax=ax[0, 0], cbar_kws={'label': 'p(first)'})
+    ax[0, 0].set_yticklabels(odorants, rotation=0);
+    sns.heatmap(lasts / lasts.sum(), cmap=cmap, ax=ax[0, 1], cbar_kws={'label': 'p(last)'})
+    ax[0, 1].set_yticklabels(odorants, rotation=0)
+    sns.heatmap(firsts.corr(), ax=ax[1, 0], cmap='RdBu_r', vmin=-1, vmax=1, cbar_kws={'label': 'r(first)'})
+    sns.heatmap(lasts.corr(), ax=ax[1, 1], cmap='RdBu_r', vmin=-1, vmax=1, cbar_kws={'label': 'r(last)'})
+    plt.tight_layout()
+    
+    
+def anova_eta2(df, ax=None):
+    z = df.stack().reset_index()
+    z = z.rename(columns={0: 'Rank'})
+    aov = pg.anova(dv='Rank', between=['Group', 'OdorName'], data=z, detailed=True, effsize='n2').set_index('Source')
+    assert aov.loc['Group', 'n2'] < 0.0001
+    aov = aov.drop('Group')
+    aov.loc['Residual', 'n2'] = 1 - aov['n2'].sum()
+    aov = aov.rename(index={'Residual': 'Individual', 'Group': 'Culture', 'OdorName': 'Odor', 'Group * OdorName': 'Culture x Odor'})
+    return aov
+
+
+def get_eta2(raw_data, n_shuffles=25):
+    groups = raw_data.index.unique('Group')
+    shuffle_types = ['odors-within-culture', 'individuals']
+    aov = anova_eta2(raw_data)
+    eta2_mean = pd.DataFrame(columns=pd.Index(['raw']+shuffle_types, name='Shuffle Type'))
+    eta2_sd = pd.DataFrame(columns=eta2_mean.columns)
+    eta2_mean['raw'] = aov['n2']
+    eta2_sd['raw'] = aov['n2']*0
+    for shuffle_type in tqdm(shuffle_types):
+        eta2_vals = pd.DataFrame(columns=aov['n2'].index)
+        for i in trange(n_shuffles, leave=False):
+            key = 'shuffle-%s' % shuffle_type
+            shuffled_data = shuffle_data(raw_data, groups, shuffle_type, random_state=i)
+            aov = anova_eta2(shuffled_data)
+            eta2_vals.loc[i] = aov['n2']
+        eta2_mean[shuffle_type] = eta2_vals.mean()
+        eta2_sd[shuffle_type] = eta2_vals.std()
+    return eta2_mean, eta2_sd
+
+
+def fig_eta2(eta2_mean, eta2_sd, simplify=False):
+    """A figure for showing eta^2 for the various ANOVA model factors."""
+    colors = ['black', 'forestgreen', 'goldenrod']
+    labels = ['Data', 'Odors shuffled\nwithin cultures', 'Individuals shuffled\nacross cultures']
+    maxx = eta2_mean.max().max()*1.1
+    if simplify:
+        eta2_mean = eta2_mean['raw']
+        eta2_sd = eta2_sd['raw']
+        colors = ['lightgreen', 'mediumpurple', 'sandybrown']
+        labels = ['']
+        figsize = (7, 3)
+    else:
+        figsize = (15, 5)
+    #sns.set(font_scale=1.4)
+    #sns.set_style('whitegrid')
+    plt.figure(figsize=figsize)
+    ax = eta2_mean.plot.barh(color=colors, yerr=eta2_sd, ax=plt.gca())
+    ax.set_xlabel('$\eta^2$');
+    ax.set_ylabel('')
+    if simplify:
+        ax.set_yticklabels(x.get_text().split(' x ')[0] for x in ax.get_yticklabels())
+    ax.set_xlim(0, maxx)
+    if not simplify:
+        l = ax.legend(loc=(0.78, 0.2), fontsize=14)
+        _ = [old_label.set_text(labels[i]) for i, old_label in enumerate(l.get_texts())]
+    
+    
+def shuffled_variances(raw_data, odorants):
+    groups = raw_data.index.unique('Group')
+    variances = pd.DataFrame(0, index=odorants, columns=['total', 'across', 'within',
+                                                         'total-odors-shuffle', 'across-individuals-shuffle',
+                                                         'within-individuals-shuffle', 'total-odors-within-culture-shuffle',
+                                                         'across-odors-within-culture-shuffle', 'within-odors-within-culture-shuffle'])
+    shuffles = ['odors-within-culture', 'individuals', 'odors']
+    n_shuffles = 100
+    for i in range(n_shuffles):
+        for shuffle in shuffles:
+            data['shuffle-%s' % shuffle] = up.shuffle_data(data['raw'], groups, shuffle, random_state=i)
+        variances['total'] += data['raw'].var()
+        variances['across'] += data['raw'].groupby('Group').mean().var()
+        variances['within'] += data['raw'].groupby('Group').var().mean()
+        variances['total-odors-shuffle'] += data['shuffle-odors'].var()
+        variances['across-individuals-shuffle'] += data['shuffle-individuals'].groupby('Group').mean().var()
+        variances['within-individuals-shuffle'] += data['shuffle-individuals'].groupby('Group').var().mean()
+        variances['total-odors-within-culture-shuffle'] += data['shuffle-odors-within-culture'].var()
+        variances['across-odors-within-culture-shuffle'] += data['shuffle-odors-within-culture'].groupby('Group').mean().var()
+        variances['within-odors-within-culture-shuffle'] += data['shuffle-odors-within-culture'].groupby('Group').var().mean()
+    variances /= n_shuffles
+    return variances
+
+
+def get_model_predictions(odorants):
+    # Load predictions from DREAM model
+    model_predictions = pd.read_csv('data/dream_model_prediction.csv', header=1, index_col=0).drop('CID')
+
+    # Mapping between PubChem IDs and molecule names
+    cids = {379: 'Octanoic acid', 1183: 'Vanillin', 3314: 'Eugenol', 6054: '2-Phenylethanol', 6549: 'Linalool',
+            7762: 'Ethyl butyrate', 8077: 'Diethyl disulfide', 10430: 'Isovaleric acid', 18827: '1-Octen-3-ol', 32594: '2-Isobutyl-3-methoxypyrazine'}
+
+    # Join model predictions with molecule names and sort
+    model_predictions.index = model_predictions.index.astype(int)
+    model_predictions = model_predictions.join(pd.Series(cids, name='Name')).set_index('Name')
+    # Use out-of-sample prediction
+    model_predictions = model_predictions.loc[odorants, 'Predicted_OUT'].rank(ascending=False).astype(int)
+    return model_predictions
