@@ -600,3 +600,52 @@ def get_model_predictions(odorants):
     # Use out-of-sample prediction
     model_predictions = model_predictions.loc[odorants, 'Predicted_OUT'].rank(ascending=False).astype(int)
     return model_predictions
+
+
+def get_kt(df1, df2):
+    """Compute Kendall-Tau correlation for all pairs of individuals in two dataframes"""
+    taus = pd.DataFrame(index=df1.index, columns=df2.index)
+    for individual1 in tqdm(taus.index):
+        for individual2 in taus.columns.drop(individual1, errors='ignore'):
+            x = df1.loc[individual1]
+            y = df2.loc[individual2]
+            taus.loc[individual1, individual2] = kendalltau(x, y)[0]
+    return taus
+
+
+def summarize_kt(taus, ax=None):
+    taus_mean = taus.astype('float').groupby('Group').mean().T.groupby('Group').mean()
+    z = taus.astype('float').groupby('Group').mean().T.groupby('Group').mean().unstack()
+    same = z[z.index.get_level_values(0) == z.index.get_level_values(1)]
+    diff = z[z.index.get_level_values(0) != z.index.get_level_values(1)]
+    print("Tau Same Culture: %.2g +/- %.2g" % (same.mean(), same.std()))
+    print("Tau Different Culture: %.2g +/- %.2g" % (diff.mean(), diff.std()))
+    z = taus_mean.round(2)
+    z[(z > -0.005) & (z < 0.005)] = 0  # Fix visualization issue which shows -0 instead of 0
+    ax = sns.heatmap(z, vmin=-0.5, vmax=0.5, cmap='RdBu_r', annot=True, annot_kws={'fontsize': 10}, ax=ax, cbar_kws={"shrink": .6})
+    ax.set_xlabel('')
+    ax.set_ylabel('')
+
+    
+def fig_intensity_control(taus_pi, taus_pp, taus_ii):
+    fig = plt.figure(figsize=(15, 15))
+    widths = [16, 8]
+    heights = [6, 8]
+    spec = fig.add_gridspec(ncols=2, nrows=2, width_ratios=widths, height_ratios=heights)
+
+    ax = fig.add_subplot(spec[0, 0], label='pi')
+    summarize_kt(taus_pi, ax=ax)
+    ax.set_aspect("equal")
+    ax.set_ylabel('Intensity')
+
+    ax = fig.add_subplot(spec[1, 0], label='pp')
+    summarize_kt(taus_pp, ax=ax)
+    ax.set_aspect("equal")
+    ax.set_xlabel('Pleasantness')
+    ax.set_ylabel('Pleasantness')
+
+    ax = fig.add_subplot(spec[0, 1], label='ii')
+    summarize_kt(taus_ii, ax=ax)
+    ax.set_aspect("equal")
+    ax.set_xlabel('Intensity')
+    plt.tight_layout()
