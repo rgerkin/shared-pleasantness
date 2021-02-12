@@ -27,10 +27,10 @@ parameters {
     vector[n_odorants] mu_global; // The global valence for each odorant
     matrix[n_groups, n_odorants] mu_group; // The group-level valences for each odorant
     matrix[n_individuals, n_odorants] mu_ind; // The individual-level valences for each odorant
-    real<lower=0> sigma_global; // The variability of the distribution from which global valences are drawn
-    real<lower=0> sigma_group; // The variability of the conditional distribution from which group valences are drawn
+    real<lower=1e-9> sigma_global; // The variability of the distribution from which global valences are drawn
+    real<lower=1e-9> sigma_group; // The variability of the conditional distribution from which group valences are drawn
     //real<lower=0> sigma_ind; // The variability of the conditional distribution from which individual valences are drawn
-    real<lower=0> sigma_ind[n_groups]; // The variability of the conditional distribution from which individual valences are drawn
+    real<lower=1e-9> sigma_ind[n_groups]; // The variability of the conditional distribution from which individual valences are drawn
     }
     
 // The model also indirectly estimates this, but it is only used to center the valences

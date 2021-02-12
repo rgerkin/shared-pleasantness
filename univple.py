@@ -14,7 +14,7 @@ import pingouin as pg
 import platform
 import pyrfume
 import pystan
-from scipy.stats import norm, kendalltau, kstest
+from scipy.stats import norm, binom, kendalltau, kstest, chi2
 import seaborn as sns
 from sklearn.decomposition import PCA
 from sklearn.manifold import MDS
@@ -23,8 +23,9 @@ import warnings
 from wurlitzer import sys_pipes
 os.environ['NUMEXPR_MAX_THREADS'] = '8'
 
-N_SUBJECTS = 283
-
+N_SUBJECTS = 280
+REPLACEMENTS = {"Cha'palaa": "Chachi",
+                'Imbabura Quechua': 'Imbabura Quichua'}
 
 def load_data(by='odor'):
     data = pd.read_csv('data/Universal Pleasantness.csv')
@@ -33,7 +34,22 @@ def load_data(by='odor'):
     if by=='ranks':
         data = data.apply(np.argsort, axis=1)+1
         data.columns = ['1st', '2nd', '3rd'] + ['%dth' % x for x in range(4, 11)]
+    # 3 Maniq could not complete the control Animal Ranking task and were excluded:
+    data = data.drop([('Maniq', i) for i in (1, 4, 8)])
+    data = data.rename(index=REPLACEMENTS)
     return data, odorants
+
+
+def load_intensity_data(odorants, by='ranks'):
+    data = pd.read_csv('data/All data intensity.txt', sep='\t')
+    data = data.rename(columns={'Participant number ': 'Participant', 'Language/Group': 'Group'}).set_index(['Group', 'Participant'])
+    data = data.rename(index=REPLACEMENTS)
+    data.columns.name = 'Rank'
+    data.columns = range(1, 11) # 1 is the highest-ranked intensity
+    if by=='odor':
+        data = data.apply(np.argsort, axis=1)+1
+        data.columns = odorants
+    return data
 
 
 def shuffle_data(data, groups, how, random_state=0):
@@ -204,7 +220,8 @@ def plot_global_means(groups, odorants, samples):
         m = [samples['mu_group[%d,%d]' % (i+1, j+1)].mean() for j in order]
         s = [samples['mu_group[%d,%d]' % (i+1, j+1)].std() for j in order]
         ax[1].errorbar(m, range(len(odorants)), xerr=s, alpha=0.5, marker='o', label=group)
-    ax[1].set_yticks(range(len(odorants)), [odorants[i] for i in order])
+    ax[1].set_yticks(range(len(odorants)))
+    ax[1].set_yticklabels([odorants[i] for i in order])
     ax[1].set_xlabel('Group Valence')
     ax[1].legend(loc=(1.04, 0))
     
@@ -213,8 +230,8 @@ def plot_global_means(groups, odorants, samples):
 # individual-level sigmas for each group
 def plot_sigmas(samples, groups):
     samples['sigma_ind'] = samples[['sigma_ind[%d]' % i for i in range(1, len(groups)+1)]].median(axis=1)
-    sigmas = {'$\sigma_{global}$': 'sigma_global',
-              '$\sigma_{group}$': 'sigma_group',
+    sigmas = {'$\sigma_{universal}$': 'sigma_global',
+              '$\sigma_{culture}$': 'sigma_group',
               '$\sigma_{individual}$': 'sigma_ind'}
     fig = plt.figure(figsize=(10, 5))
     gs = fig.add_gridspec(3, 2)
@@ -436,19 +453,23 @@ def plot_ind_corrs(data, samples, groups, odorants):
     plt.tight_layout();
 
     
-def compute_kendall_taus(raw_data, model_predictions):
-    """Compute Kendall-Tau correlation for ranks between individuals, and between model predictions and individuals."""
-    taus = pd.DataFrame(index=raw_data.index, columns=raw_data.index)
-    for individual1 in tqdm(taus.index):
-        for individual2 in taus.columns.drop(individual1):
-            x = raw_data.loc[individual1]
-            y = raw_data.loc[individual2]
-            taus.loc[individual1, individual2] = kendalltau(x, y)[0]
-    taus.loc[('Model', 1), :] = raw_data.apply(lambda x: kendalltau(model_predictions, x)[0], axis=1)
-    return taus
+def compute_kendall_taus(df1, df2, model=None, **kwargs):
+    """Compute Kendall-Tau correlation for all pairs of individuals in two dataframes.
+    For example, compute Kendall-Tau correlation for ranks between individuals, and between model predictions and individuals."""
+    result = pd.DataFrame(index=df1.index, columns=df2.index)
+    for individual1 in tqdm(result.index, leave=False):
+        for individual2 in result.columns.drop(individual1, errors='ignore'):
+            x = df1.loc[individual1]
+            y = df2.loc[individual2]
+            result.loc[individual1, individual2] = kendalltau(x, y)
+    if model is not None:
+        result.loc[('Model', 1), :] = df1.apply(lambda x: kendalltau(model, x), axis=1)
+    taus = result.applymap(lambda x: x[0] if isinstance(x, tuple) else None)
+    ps = result.applymap(lambda x: x[1] if isinstance(x, tuple) else None)
+    return taus, ps
 
 
-def fig_kendall_tau(taus, groups):
+def fig_kendall_tau(taus, groups, direction='h'):
     tau_stats = pd.DataFrame(index=groups)
     for group in groups:
         group_data = taus.loc[group]
@@ -463,7 +484,10 @@ def fig_kendall_tau(taus, groups):
 
     sns.set(font_scale=1.4)
     sns.set_style('whitegrid')
-    fig, ax = plt.subplots(1, 2, figsize=(16, 7))
+    if direction == 'h':
+        fig, ax = plt.subplots(1, 2, figsize=(16, 7))
+    else:
+        fig, ax = plt.subplots(2, 1, figsize=(7, 12.5))
     cmap = cm.get_cmap('jet')
     norm = colors.Normalize(vmin=0, vmax=len(groups)-1)
     for i, group in enumerate(groups):
@@ -473,15 +497,22 @@ def fig_kendall_tau(taus, groups):
     ax[0].set_xlim(0, 0.6)
     ax[0].set_ylim(0, 0.6)
     ax[0].legend(loc=4, fontsize=11)
-    ax[0].set_title('Correlation between individual and...')
+    ax[0].set_title(r'Mean Correlation $\tau$ between individual and...')
     for i, group in enumerate(groups):
         tau_stats.loc[[group]].plot.scatter(x='Culture', y='Model', xerr='Culture_sem', yerr='Model_sem',
                                              color=cmap(norm(i)), label=group, ax=ax[1])
+    ax[0].set_xlabel('Members of the same culture')
+    ax[0].set_ylabel('All subjects')
+    
     ax[1].plot([0, 1], [0, 1], '--')
     ax[1].set_xlim(0, 0.6)
     ax[1].set_ylim(0, 0.6)
     ax[1].legend(loc=4, fontsize=11)
-    ax[1].set_title('Correlation between individual and...')
+    ax[1].set_title(r'Mean Correlation $\tau$ between individual and...')
+    ax[1].set_xlabel('Members of the same culture')
+    ax[1].set_ylabel('A universal predictive model')
+    fig_letters(ax, 2, x=-0.15, y=1.02)
+    plt.tight_layout()
     
     
 def fig_highest_lowest(ranked_data, groups, odorants):
@@ -496,12 +527,15 @@ def fig_highest_lowest(ranked_data, groups, odorants):
     cmap = copy(cm.get_cmap('Reds'))
     cmap.set_bad('white')
     sns.heatmap(firsts / firsts.sum(), cmap=cmap, ax=ax[0, 0], cbar_kws={'label': 'p(first)'})
+    ax[0, 0].set_yticks(range(len(odorants)))
     ax[0, 0].set_yticklabels(odorants, rotation=0);
     sns.heatmap(lasts / lasts.sum(), cmap=cmap, ax=ax[0, 1], cbar_kws={'label': 'p(last)'})
+    ax[0, 1].set_yticks(range(len(odorants)))
     ax[0, 1].set_yticklabels(odorants, rotation=0)
     sns.heatmap(firsts.corr(), ax=ax[1, 0], cmap='RdBu_r', vmin=-1, vmax=1, cbar_kws={'label': 'r(first)'})
     sns.heatmap(lasts.corr(), ax=ax[1, 1], cmap='RdBu_r', vmin=-1, vmax=1, cbar_kws={'label': 'r(last)'})
     plt.tight_layout()
+    fig_letters(ax, 4, x=-0.5)
     
     
 def anova_eta2(df, ax=None):
@@ -535,30 +569,45 @@ def get_eta2(raw_data, n_shuffles=25):
     return eta2_mean, eta2_sd
 
 
-def fig_eta2(eta2_mean, eta2_sd, simplify=False):
+def fig_eta2(eta2_mean, eta2_sd, simplify=False, colors = ['lightgreen', 'mediumpurple', 'sandybrown'], direction='h'):
     """A figure for showing eta^2 for the various ANOVA model factors."""
-    colors = ['black', 'forestgreen', 'goldenrod']
-    labels = ['Data', 'Odors shuffled\nwithin cultures', 'Individuals shuffled\nacross cultures']
     maxx = eta2_mean.max().max()*1.1
     if simplify:
         eta2_mean = eta2_mean['raw']
-        eta2_sd = eta2_sd['raw']
-        colors = ['lightgreen', 'mediumpurple', 'sandybrown']
+        eta2_sd = eta2_sd['raw']    
         labels = ['']
-        figsize = (7, 3)
+        figsize = (7, 3) if direction =='h' else (5, 9)
     else:
-        figsize = (15, 5)
+        labels = ['Individual', 'Culture', 'Odor']
+        figsize = (15, 5) if direction =='h' else (3, 9)
     #sns.set(font_scale=1.4)
     #sns.set_style('whitegrid')
     plt.figure(figsize=figsize)
-    ax = eta2_mean.plot.barh(color=colors, yerr=eta2_sd, ax=plt.gca())
-    ax.set_xlabel('$\eta^2$');
-    ax.set_ylabel('')
+    if direction == 'h':
+        ax = eta2_mean.T.plot.barh(color=colors, yerr=eta2_sd.T, ax=plt.gca())
+        ax.set_xlabel('$\eta^2$');
+        ax.set_ylabel('')
+    else:
+        ax = eta2_mean.T.plot.bar(color=colors, yerr=eta2_sd.T, ax=plt.gca())
+        ax.set_ylabel('$\eta^2$');
+        ax.set_xlabel('')
     if simplify:
-        ax.set_yticklabels(x.get_text().split(' x ')[0] for x in ax.get_yticklabels())
-    ax.set_xlim(0, maxx)
+        if direction == 'h':
+            ax.set_yticklabels(x.get_text().split(' x ')[0] for x in ax.get_yticklabels())
+        else:
+            ax.set_xticklabels(x.get_text().split(' x ')[0] for x in ax.get_xticklabels())
+    else:
+        labels = ['No shuffle', 'Shuffle odors within cultures', 'Shuffle culture labels across individuals']
+        if direction == 'h':
+            ax.set_yticklabels(labels)
+        else:
+            ax.set_xticklabels(labels)
+    if direction == 'h':
+        ax.set_xlim(0, maxx)
+    else:
+        ax.set_ylim(0, maxx)
     if not simplify:
-        l = ax.legend(loc=(0.78, 0.2), fontsize=14)
+        l = ax.legend(loc=(0.86, 0.2), fontsize=14)
         _ = [old_label.set_text(labels[i]) for i, old_label in enumerate(l.get_texts())]
     
     
@@ -588,7 +637,7 @@ def shuffled_variances(raw_data, odorants):
 
 def get_model_predictions(odorants):
     # Load predictions from DREAM model
-    model_predictions = pd.read_csv('data/dream_model_prediction.csv', header=1, index_col=0).drop('CID')
+    model_predictions = pd.read_csv('data/dream-model-prediction.csv', header=1, index_col=0).drop('CID')
 
     # Mapping between PubChem IDs and molecule names
     cids = {379: 'Octanoic acid', 1183: 'Vanillin', 3314: 'Eugenol', 6054: '2-Phenylethanol', 6549: 'Linalool',
@@ -602,50 +651,87 @@ def get_model_predictions(odorants):
     return model_predictions
 
 
-def get_kt(df1, df2):
-    """Compute Kendall-Tau correlation for all pairs of individuals in two dataframes"""
-    taus = pd.DataFrame(index=df1.index, columns=df2.index)
-    for individual1 in tqdm(taus.index):
-        for individual2 in taus.columns.drop(individual1, errors='ignore'):
-            x = df1.loc[individual1]
-            y = df2.loc[individual2]
-            taus.loc[individual1, individual2] = kendalltau(x, y)[0]
-    return taus
-
-
-def summarize_kt(taus, ax=None):
+def summarize_kt(taus, ps, ax=None):
     taus_mean = taus.astype('float').groupby('Group').mean().T.groupby('Group').mean()
+    z = taus.applymap(lambda x: True if x>0 else (False if x<0 else None))
+    ks = z.astype('float').groupby('Group').sum().T.groupby('Group').sum()
+    ns = z.groupby('Group').count().T.groupby('Group').sum()
+    for group in ks.index:
+        ks.loc[group, group] /= 2
+        ns.loc[group, group] /= 2
+    ps = ks.copy()
+    from scipy.stats import binom
+    ps[:] = 1-binom.cdf(ks.values, ns.loc[ks.index, ks.columns].values, 0.5)
+    from math import prod
+    ps *= prod(ps.shape)  # Bonferonni correction
+    ps = ps.clip(0, 1)
+    f = lambda x: '***' if x<1e-10 else '**' if x<1e-4 else '*' if x < 1e-2 else ''
+    ps = ps.applymap(f)
     z = taus.astype('float').groupby('Group').mean().T.groupby('Group').mean().unstack()
     same = z[z.index.get_level_values(0) == z.index.get_level_values(1)]
     diff = z[z.index.get_level_values(0) != z.index.get_level_values(1)]
-    print("Tau Same Culture: %.2g +/- %.2g" % (same.mean(), same.std()))
-    print("Tau Different Culture: %.2g +/- %.2g" % (diff.mean(), diff.std()))
+    print("\tTau Same Culture: %.2g +/- %.2g" % (same.mean(), same.std()))
+    print("\tTau Different Culture: %.2g +/- %.2g" % (diff.mean(), diff.std()))
     z = taus_mean.round(2)
     z[(z > -0.005) & (z < 0.005)] = 0  # Fix visualization issue which shows -0 instead of 0
-    ax = sns.heatmap(z, vmin=-0.5, vmax=0.5, cmap='RdBu_r', annot=True, annot_kws={'fontsize': 10}, ax=ax, cbar_kws={"shrink": .6})
+    ax = sns.heatmap(z, vmin=-0.5, vmax=0.5, cmap='RdBu_r', annot=ps, annot_kws={'fontsize': 14},
+                     fmt='', ax=ax, cbar_kws={'shrink': .6, 'label': r'$\tau$'})
     ax.set_xlabel('')
     ax.set_ylabel('')
+    #plt.figure()
+    #ax = sns.heatmap(p_pooled.round(3), vmin=0, vmax=1, cmap='magma', annot=True, annot_kws={'fontsize': 10}, ax=ax, cbar_kws={"shrink": .6})
+    #ax.set_xlabel('')
+    #ax.set_ylabel('')
 
     
-def fig_intensity_control(taus_pi, taus_pp, taus_ii):
+def fig_intensity_control(taus_pi, taus_pp, taus_ii, ps_pi, ps_pp, ps_ii):
     fig = plt.figure(figsize=(15, 15))
     widths = [16, 8]
     heights = [6, 8]
     spec = fig.add_gridspec(ncols=2, nrows=2, width_ratios=widths, height_ratios=heights)
 
     ax = fig.add_subplot(spec[0, 0], label='pi')
-    summarize_kt(taus_pi, ax=ax)
+    print('Pleasantness vs Intensity:')
+    summarize_kt(taus_pi, ps_pi, ax=ax)
     ax.set_aspect("equal")
     ax.set_ylabel('Intensity')
+    ax.set_xticks(ax.get_xticks()+0.2)
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right', va='top')
+    fig_letter(ax, 'A', x=-0.4, y=1.02)
 
     ax = fig.add_subplot(spec[1, 0], label='pp')
-    summarize_kt(taus_pp, ax=ax)
+    print('Pleasantness vs Pleasantness')
+    summarize_kt(taus_pp, ps_pi, ax=ax)
     ax.set_aspect("equal")
     ax.set_xlabel('Pleasantness')
     ax.set_ylabel('Pleasantness')
+    ax.set_xticks(ax.get_xticks()+0.2)
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right', va='top')
+    fig_letter(ax, 'B', x=-0.4, y=1.02)
 
     ax = fig.add_subplot(spec[0, 1], label='ii')
-    summarize_kt(taus_ii, ax=ax)
+    print('Intensity vs Intensity:')
+    summarize_kt(taus_ii, ps_pi, ax=ax)
     ax.set_aspect("equal")
     ax.set_xlabel('Intensity')
+    ax.set_xticks(ax.get_xticks()+0.2)
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right', va='top')
+    fig_letter(ax, 'C', x=-0.4, y=1.02)
+    
     plt.tight_layout()
+
+    
+def fig_letters(axes, n, x=-0.15, y=1.02):
+    for i in range(n):
+        ax = axes.flat[i]
+        fig_letter(ax, "ABCDEFGHIJK"[i], x=x, y=y)
+        
+
+def fig_letter(ax, letter, x=-0.15, y=1.02):
+    ax.text(x,
+            y,
+            letter,
+            transform=ax.transAxes,
+            fontweight="bold",
+            fontsize=18)
+        
