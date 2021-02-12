@@ -1,1 +1,1 @@
-Code and Data for "The perception of odor pleasantness is shared across cultures" (Arshamian et al, 2021) will be deposited here upon publication.
+Code and Data for "The perception of odor pleasantness is shared across cultures" (Arshamian et al, 2021) will be deposited here upon publication.  Reviewers may download a package of code and data via the review website.
