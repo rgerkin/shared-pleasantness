@@ -1,4 +1,5 @@
-# Universal pleasantness project from Majid lab
+"""Code for "The perception of odor pleasantness is shared across cultures" (Arshamian et al, 2021).
+See Jupyter notebooks for usage and reproduction of figures and tables."""
 
 from copy import copy
 import joblib
@@ -23,11 +24,24 @@ import warnings
 from wurlitzer import sys_pipes
 os.environ['NUMEXPR_MAX_THREADS'] = '8'
 
+# Number of subjects in dataset
 N_SUBJECTS = 280
+
+# Name corrections
 REPLACEMENTS = {"Cha'palaa": "Chachi",
-                'Imbabura Quechua': 'Imbabura Quichua'}
+                'Imbabura Quechua': 'Imbabura Quichua',
+                'New York City': 'American'}
+
+
+### Begin functions for loading and shuffling data ###
 
 def load_data(by='odor'):
+    """Load and organize raw pleasantness ranking data.
+    
+    Args:
+        by: whether to load by organize by odorant name or by rank
+    Returns: A dataframe with the data and the names of the odorants
+    """
     data = pd.read_csv('data/Universal Pleasantness.csv')
     data = data.set_index(['Group', 'Participant', 'OdorName']).unstack('OdorName')['Ranking'].astype(int)
     odorants = list(data)
@@ -37,51 +51,94 @@ def load_data(by='odor'):
     # 3 Maniq could not complete the control Animal Ranking task and were excluded:
     data = data.drop([('Maniq', i) for i in (1, 4, 8)])
     data = data.rename(index=REPLACEMENTS)
+    data = data.sort_index()
     return data, odorants
 
 
 def load_intensity_data(odorants, by='ranks'):
+    """Load and organize raw intensity ranking data
+    
+    Args:
+        by: whether to load by organize by odorant name or by rank
+    Returns: A dataframe with the data and the names of the odorants
+    """
     data = pd.read_csv('data/All data intensity.txt', sep='\t')
-    data = data.rename(columns={'Participant number ': 'Participant', 'Language/Group': 'Group'}).set_index(['Group', 'Participant'])
+    data = data.rename(columns={'Participant number ': 'Participant',
+                                'Language/Group': 'Group'}).set_index(['Group', 'Participant'])
     data = data.rename(index=REPLACEMENTS)
     data.columns.name = 'Rank'
     data.columns = range(1, 11) # 1 is the highest-ranked intensity
     if by=='odor':
         data = data.apply(np.argsort, axis=1)+1
         data.columns = odorants
+    data = data.sort_index()
     return data
 
 
 def shuffle_data(data, groups, how, random_state=0):
-    # Shuffle ranks within each group.
-    # A unique shuffle is generated for each culture, but all individuals within a group get the same shuffle
+    """Shuffle the ranking data.
+    
+    Args:
+        data: A dataframe of the ranking data
+        groups: A list of groups (cultures) in the data
+        how: A shuffled method.
+        random_state: A random seed for reproducible shuffling
+    Returns: A dataframe with shuffled data
+    """
     n_individuals, n_odorants = data.shape
     n_groups = len(groups)
     data_sh = data.copy()
     if how == 'odors-within-culture':
+        # A unique shuffle is generated for each culture,
+        # but all individuals within a group get the same shuffle.
         for i, group in enumerate(groups):
             group_index = data.index.get_level_values('Group') == group
             data_sh.loc[group_index] = data.loc[group_index].sample(frac=1, replace=False, axis=1, random_state=random_state+i).values
-        #data_sh.index = data.index
-        #shuffles = [np.argsort(np.random.randn(n_odorants)) for i in range(len(groups))]
-        #data_sh = data.apply(lambda x: x[shuffles[groups.index(x.name[0])]].reset_index(drop=True), axis=1)
-        #data_sh.columns = data.columns
+    elif how == 'swap-individuals-within-culture':
+        for i, group in enumerate(groups):
+            group_index = data.index.get_level_values('Group') == group
+            data_sh.loc[group_index] = data.loc[group_index].sample(frac=1, replace=False, axis=0, random_state=random_state+i).values
     elif how == 'individuals':
         data_sh[:] = data.sample(frac=1, replace=False, random_state=random_state).values
-        #data_sh.index = data.index
     elif how == 'odors':
         data_sh[:] = data.sample(frac=1, replace=False, random_state=random_state, axis=1).values
-        #data_sh.index = data.index
     else:
         raise Exception(f"No such shuffle method: {how}")
     return data_sh
 
 
 def get_groups(data):
+    """Get groups (cultures) from the data.
+    
+    Args:
+        data: A dataframe of ranking data
+    Returns:
+        A tuple of lists: (1) all groups (cultures) and (2) associated individual-level group IDs
+    """
     groups = list(data.index.get_level_values('Group').unique())
     group_ids = data.index.map(lambda x: groups.index(x[0])+1).values # Integer group IDs for each individual
     return groups, group_ids
 
+
+def get_model_predictions(odorants):
+    """Get the pleasantness predictions of the DREAM model (Keller et al, 2017)"""
+    # Load predictions from DREAM model
+    model_predictions = pd.read_csv('data/dream-model-prediction.csv', header=1, index_col=0).drop('CID')
+
+    # Mapping between PubChem IDs and molecule names
+    cids = {379: 'Octanoic acid', 1183: 'Vanillin', 3314: 'Eugenol', 6054: '2-Phenylethanol', 6549: 'Linalool',
+            7762: 'Ethyl butyrate', 8077: 'Diethyl disulfide', 10430: 'Isovaleric acid', 18827: '1-Octen-3-ol', 32594: '2-Isobutyl-3-methoxypyrazine'}
+
+    # Join model predictions with molecule names and sort
+    model_predictions.index = model_predictions.index.astype(int)
+    model_predictions = model_predictions.join(pd.Series(cids, name='Name')).set_index('Name')
+    # Use out-of-sample prediction
+    model_predictions = model_predictions.loc[odorants, 'Predicted_OUT'].rank(ascending=False).astype(int)
+    return model_predictions
+
+### End functions for loading and shuffling data ###
+
+##### Begin functions for the Bayesian analsis #####
 
 def get_model_path(models_path: str, model_name: str,
                    compiled: bool = False, with_suffix: bool = False,
@@ -91,7 +148,6 @@ def get_model_path(models_path: str, model_name: str,
     Args:
         models_path: Path to directory where models are stored.
         model_name: Name of the model (without .stan suffix).
-
     Returns:
         A full path to a Stan model file.
     """
@@ -113,13 +169,12 @@ def get_model_path(models_path: str, model_name: str,
 def load_or_compile_stan_model(model_name: str, models_path: str = '.',
                                force_recompile: bool = False,
                                verbose: bool = False):
-    """Loads a compiled Stan model from disk or compiles it if does not exist.
+    """Loads a compiled Stan (Bayesian) model from disk or compiles it if does not exist.
 
     Args:
         model_name (str): Name of the stan model (i.e. model filename without the .stan suffix)
         force_recompile (bool, optional): [description]. Defaults to False.
         verbose (bool, optional): [description]. Defaults to False.
-
     Returns:
         [type]: [description]
     """
@@ -133,7 +188,6 @@ def load_or_compile_stan_model(model_name: str, models_path: str = '.',
         stan_compiled_last_mod_t = 0
     if force_recompile or (stan_compiled_last_mod_t < stan_raw_last_mod_t):
         models_path = str(Path(models_path).resolve())
-        print(models_path)
         sm = pystan.StanModel(file=str(uncompiled_path), include_paths=[models_path])
         with open(compiled_path, 'wb') as f:
             pickle.dump(sm, f)
@@ -146,13 +200,32 @@ def load_or_compile_stan_model(model_name: str, models_path: str = '.',
 
 
 def fit_model(model, d, warmup=5000, iter=20000):
+    """Fit a Stan model.
+    
+    Args:
+        model: The compiled Stan model
+        d: The ranking data
+        iter: The number of iterations (after warmup)
+    Returns:
+        A tuple of model fit (a Stan object) and samples from that fit (a dataframe)
+    """
     # The data that needs to be passed to the Stan model
     groups = list(d.index.get_level_values('Group').unique())
+    #data_ = {
+    #    'n_odorants': 10, # How many odorants
+    #    'n_individuals': d.shape[0], # How many individuals
+    #    'n_groups': len(groups), # How many groups
+    #    'group_id': d.index.map(lambda x: groups.index(x[0])+1).values, # Integer group IDs for each individual
+    #    'ranks': d.iloc[:, -10:].values  # The last 10 columns of the dataframe, i.e. the ranking data
+    #}
+    individuals = d.index.unique().tolist()
     data_ = {
         'n_odorants': 10, # How many odorants
-        'n_individuals': d.shape[0], # How many individuals
+        'n_observations': d.shape[0], # How many individuals
         'n_groups': len(groups), # How many groups
-        'group_id': d.index.map(lambda x: groups.index(x[0])+1).values, # Integer group IDs for each individual
+        'n_individuals': len(individuals), # How many groups
+        'group_id': d.index.map(lambda x: groups.index(x[0])+1).values, # Integer group IDs for each observation
+        'individual_id': d.index.map(lambda x: individuals.index(x)+1).values, # Integer individual IDs for each observation
         'ranks': d.iloc[:, -10:].values  # The last 10 columns of the dataframe, i.e. the ranking data
     }
     
@@ -171,6 +244,8 @@ def fit_model(model, d, warmup=5000, iter=20000):
 
 
 def load_or_sample(model, data, name, use_cache=True, warmup=5000, iter=20000):
+    """Load the samples from a fitted Stan model or
+    fit (and save) the samples if they do not yet exist"""
     name = 'samples_%s_%s_%s' % (name, joblib.hash(model), joblib.hash(data))
     path = pathlib.Path(name)
     if path.exists() and use_cache:
@@ -182,6 +257,7 @@ def load_or_sample(model, data, name, use_cache=True, warmup=5000, iter=20000):
         
     
 def plot_global_agreement(samples, odorants):
+    """Plot agreement between sampling chains to assess convergence of the model fit"""
     # Check to see if chains (independent sampling runs) agree
     # This will be indiciated by each panel having 4 very similary (heavily overlapping) histograms
     fig, axes = plt.subplots(5, 2, sharex=True, figsize=(7, 6))
@@ -198,6 +274,7 @@ def plot_global_agreement(samples, odorants):
     
     
 def get_order(odorants, samples):
+    """Get overall (universal) pleasantness order from the Bayesian model"""
     # Compute global mean valences for each odorant
     global_means = [samples['mu_global[%d]' % (j+1)].mean() for j in range(len(odorants))]
     # Get their order (by global mean descending) so we can plot all data in a common, sensible order
@@ -206,7 +283,7 @@ def get_order(odorants, samples):
 
 
 def plot_global_means(groups, odorants, samples):
-    # How do the odors differ in global valence?
+    """How do the odors differ in global valence?"""
     # Note that 0 is meaningless (it is not the transition between pleasant and unpleasant)
     # Results would be identical of a constant was added to all values
     fig, ax = plt.subplots(1, 2, figsize=(10, 5), sharey=True)
@@ -226,11 +303,11 @@ def plot_global_means(groups, odorants, samples):
     ax[1].legend(loc=(1.04, 0))
     
     
-# Create an individual level sigma which is the mean of the
-# individual-level sigmas for each group
 def plot_sigmas(samples, groups):
+    """Create an individual level sigma which is the mean of the
+    individual-level sigmas for each group"""
     samples['sigma_ind'] = samples[['sigma_ind[%d]' % i for i in range(1, len(groups)+1)]].median(axis=1)
-    sigmas = {'$\sigma_{universal}$': 'sigma_global',
+    sigmas = {'$\sigma_{odor}$': 'sigma_global',
               '$\sigma_{culture}$': 'sigma_group',
               '$\sigma_{individual}$': 'sigma_ind'}
     fig = plt.figure(figsize=(10, 5))
@@ -358,62 +435,6 @@ def ranks_vs_values(samples, groups):
     plt.ylabel("Number of subjects")
     
     
-def ss(coords, clusters):
-    """Sum of squares from cluster centers"""
-    x = 0
-    for cluster in clusters.values():
-        # Sum of squared distances of each cluster member to the cluster mean
-        sumsquares = (coords.loc[cluster].sub(coords.loc[cluster].mean(axis=0), axis=1)**2).sum().sum()
-        x += sumsquares
-    return x
-
-
-def ss_null(coords, by, n=1000):
-    sizes = [len(x) for x in by.values()]
-    csizes = [0] + list(np.cumsum(sizes))
-    result = []
-    for i in range(n):
-        shuffle = np.random.permutation(coords.index)
-        by_shuffle = {i: shuffle[csizes[i]:csizes[i+1]] for i in range(len(sizes))}
-        result.append(ss(coords, by_shuffle))
-    return result
-
-
-def get_supergroup_stats(samples, groups, odorants, supergroups):
-    mu_group = get_means(samples, groups, odorants, 'mu_group')
-    sg_scores = {kind: ss(mu_group, grouping) for kind, grouping in supergroups.items()}
-    sg_scores_null = {kind: ss_null(mu_group, grouping, n=10000) for kind, grouping in supergroups.items()}
-    supergroup_stats = pd.Series([(sg_scores_null[key] < sg_scores[key]).mean() for key in supergroups], index=supergroups.keys())
-    return supergroup_stats
-
-
-def plot_supergroups(samples, groups, odorants, supergroups, method='PCA'):
-    mugs = get_means(samples, groups, odorants, 'mu_group')
-    if method == 'PCA':
-        pca = PCA(n_components=2)
-        mugs_reduced = pca.fit_transform(mugs)
-    elif method == 'MDS':
-        with warnings.catch_warnings():
-            warnings.filterwarnings('ignore')
-            mds = MDS(n_components=2, dissimilarity='euclidean')
-            mugs_reduced = mds.fit_transform(mugs)
-    mugs_reduced = pd.DataFrame(mugs_reduced, index=mugs.index, columns=[1, 2])
-    supergroup_nums = []
-    fig, ax = plt.subplots(1, len(supergroups), figsize=(12, 4))
-    plt.subplots_adjust(wspace=1.5)
-    for i, (sg_label, sg) in enumerate(supergroups.items()):
-        for j, (label, some_groups) in enumerate(sg.items()):
-            c = 'rgbk'[j]
-            for k, group in enumerate(some_groups):
-                m = 'ovsp*'[k]
-                ax[i].scatter(*mugs_reduced.loc[group].T, color=c, marker=m, label='%s (%s)' % (group, label))
-        ax[i].legend(fontsize=9, loc=(1.04, 0))
-        ax[i].set_title('By %s' % sg_label.title())
-        ax[i].set_xlabel('Dim 1')
-        ax[i].set_ylabel('Dim 2')
-    plt.suptitle(method)
-    
-
 def plot_ind_corrs(data, samples, groups, odorants):
     mu_ind = get_means(samples, groups, odorants, 'mu_ind')
     mu_ind.index = data.index
@@ -451,108 +472,92 @@ def plot_ind_corrs(data, samples, groups, odorants):
             ks, p = kstest(x, 'norm', args=(z_mean, z_se))
             ax.set_title('%s (p=%.3g)' % (group, p))
     plt.tight_layout();
-
     
-def compute_kendall_taus(df1, df2, model=None, **kwargs):
-    """Compute Kendall-Tau correlation for all pairs of individuals in two dataframes.
-    For example, compute Kendall-Tau correlation for ranks between individuals, and between model predictions and individuals."""
-    result = pd.DataFrame(index=df1.index, columns=df2.index)
-    for individual1 in tqdm(result.index, leave=False):
-        for individual2 in result.columns.drop(individual1, errors='ignore'):
-            x = df1.loc[individual1]
-            y = df2.loc[individual2]
-            result.loc[individual1, individual2] = kendalltau(x, y)
-    if model is not None:
-        result.loc[('Model', 1), :] = df1.apply(lambda x: kendalltau(model, x), axis=1)
-    taus = result.applymap(lambda x: x[0] if isinstance(x, tuple) else None)
-    ps = result.applymap(lambda x: x[1] if isinstance(x, tuple) else None)
-    return taus, ps
+    
+##### End functions for the Bayesian analysis #####
+
+##### Begin functions for examining supergroups (groups of cultures) #####
+    
+def ss(coords, clusters):
+    """Sum of squares from cluster centers"""
+    x = 0
+    for cluster in clusters.values():
+        # Sum of squared distances of each cluster member to the cluster mean
+        sumsquares = (coords.loc[cluster].sub(coords.loc[cluster].mean(axis=0), axis=1)**2).sum().sum()
+        x += sumsquares
+    return x
 
 
-def fig_kendall_tau(taus, groups, direction='h'):
-    tau_stats = pd.DataFrame(index=groups)
-    for group in groups:
-        group_data = taus.loc[group]
-        n = group_data.shape[0]
-        tau_stats.loc[group, 'Culture'] = group_data[group].mean().mean()
-        tau_stats.loc[group, 'Culture_sem'] = group_data[group].std().mean() / np.sqrt(n)
-        tau_stats.loc[group, 'Universal'] = group_data.mean().mean()
-        tau_stats.loc[group, 'Universal_sem'] = group_data.std().mean() / np.sqrt(n)
-        tau_stats.loc[group, 'Model'] = taus.loc['Model', group].mean().mean()
-        # Model is the same for every group
-        tau_stats.loc[group, 'Model_sem'] = 0#taus.loc['Model', group].std().mean() / np.sqrt(n)
+def ss_null(coords, clusters, n=1000):
+    """Sum of squares from cluster centers under random (shuffled data), i.e. the null distribution"""
+    sizes = [len(x) for x in clusters.values()]
+    csizes = [0] + list(np.cumsum(sizes))
+    groups = coords.index.unique('Group')
+    result = []
+    for i in trange(n):
+        shuffle = np.random.permutation(groups)
+        new_clusters = {i: shuffle[csizes[i]:csizes[i+1]].tolist() for i in range(len(sizes))}
+        result.append(ss(coords, new_clusters))
+    return result
 
-    sns.set(font_scale=1.4)
-    sns.set_style('whitegrid')
-    if direction == 'h':
-        fig, ax = plt.subplots(1, 2, figsize=(16, 7))
-    else:
-        fig, ax = plt.subplots(2, 1, figsize=(7, 12.5))
-    cmap = cm.get_cmap('jet')
-    norm = colors.Normalize(vmin=0, vmax=len(groups)-1)
-    for i, group in enumerate(groups):
-        tau_stats.loc[[group]].plot.scatter(x='Culture', y='Universal', xerr='Culture_sem', yerr='Universal_sem',
-                                             color=cmap(norm(i)), label=group, ax=ax[0])
-    ax[0].plot([0, 1], [0, 1], '--')
-    ax[0].set_xlim(0, 0.6)
-    ax[0].set_ylim(0, 0.6)
-    ax[0].legend(loc=4, fontsize=11)
-    ax[0].set_title(r'Mean Correlation $\tau$ between individual and...')
-    for i, group in enumerate(groups):
-        tau_stats.loc[[group]].plot.scatter(x='Culture', y='Model', xerr='Culture_sem', yerr='Model_sem',
-                                             color=cmap(norm(i)), label=group, ax=ax[1])
-    ax[0].set_xlabel('Members of the same culture')
-    ax[0].set_ylabel('All subjects')
+
+def get_supergroup_stats(samples, groups, odorants, supergroups):
+    """Get statistics about these supergroups (i.e. how well-clustered are they?)"""
+    mu_group = get_means(samples, groups, odorants, 'mu_group')
+    sg_scores = {kind: ss(mu_group, grouping) for kind, grouping in supergroups.items()}
+    sg_scores_null = {kind: ss_null(mu_group, grouping, n=10000) for kind, grouping in supergroups.items()}
+    supergroup_stats = pd.Series([(sg_scores_null[key] < sg_scores[key]).mean() for key in supergroups], index=supergroups.keys())
+    return supergroup_stats
+
+
+def plot_supergroups(samples, groups, odorants, supergroups, method='PCA'):
+    """Plot supergroups"""
+    mugs = get_means(samples, groups, odorants, 'mu_group')
+    if method == 'PCA':
+        pca = PCA(n_components=2)
+        mugs_reduced = pca.fit_transform(mugs)
+    elif method == 'MDS':
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore')
+            mds = MDS(n_components=2, dissimilarity='euclidean')
+            mugs_reduced = mds.fit_transform(mugs)
+    mugs_reduced = pd.DataFrame(mugs_reduced, index=mugs.index, columns=[1, 2])
+    supergroup_nums = []
+    fig, ax = plt.subplots(1, len(supergroups), figsize=(12, 4))
+    plt.subplots_adjust(wspace=1.5)
+    for i, (sg_label, sg) in enumerate(supergroups.items()):
+        for j, (label, some_groups) in enumerate(sg.items()):
+            c = 'rgbk'[j]
+            for k, group in enumerate(some_groups):
+                m = 'ovsp*'[k]
+                ax[i].scatter(*mugs_reduced.loc[group].T, color=c, marker=m, label='%s (%s)' % (group, label))
+        ax[i].legend(fontsize=9, loc=(1.04, 0))
+        ax[i].set_title('By %s' % sg_label.title())
+        ax[i].set_xlabel('Dim 1')
+        ax[i].set_ylabel('Dim 2')
+    plt.suptitle(method)
     
-    ax[1].plot([0, 1], [0, 1], '--')
-    ax[1].set_xlim(0, 0.6)
-    ax[1].set_ylim(0, 0.6)
-    ax[1].legend(loc=4, fontsize=11)
-    ax[1].set_title(r'Mean Correlation $\tau$ between individual and...')
-    ax[1].set_xlabel('Members of the same culture')
-    ax[1].set_ylabel('A universal predictive model')
-    fig_letters(ax, 2, x=-0.15, y=1.02)
-    plt.tight_layout()
+##### End functions for examining supergroups (groups of cultures)  #####
+
+### Begin functions for ANOVA analysis
     
-    
-def fig_highest_lowest(ranked_data, groups, odorants):
-    fig, ax = plt.subplots(2, 2, sharex=True, figsize=(15, 8))
-    firsts = pd.DataFrame(index=range(1, 11), columns=groups)
-    lasts = pd.DataFrame(index=range(1, 11), columns=groups)
-    for group in groups:
-        firsts[group] = ranked_data.loc[group, '1st'].value_counts()
-        lasts[group] = ranked_data.loc[group, '10th'].value_counts()
-    firsts = firsts.fillna(0)
-    lasts = lasts.fillna(0)
-    cmap = copy(cm.get_cmap('Reds'))
-    cmap.set_bad('white')
-    sns.heatmap(firsts / firsts.sum(), cmap=cmap, ax=ax[0, 0], cbar_kws={'label': 'p(first)'})
-    ax[0, 0].set_yticks(range(len(odorants)))
-    ax[0, 0].set_yticklabels(odorants, rotation=0);
-    sns.heatmap(lasts / lasts.sum(), cmap=cmap, ax=ax[0, 1], cbar_kws={'label': 'p(last)'})
-    ax[0, 1].set_yticks(range(len(odorants)))
-    ax[0, 1].set_yticklabels(odorants, rotation=0)
-    sns.heatmap(firsts.corr(), ax=ax[1, 0], cmap='RdBu_r', vmin=-1, vmax=1, cbar_kws={'label': 'r(first)'})
-    sns.heatmap(lasts.corr(), ax=ax[1, 1], cmap='RdBu_r', vmin=-1, vmax=1, cbar_kws={'label': 'r(last)'})
-    plt.tight_layout()
-    fig_letters(ax, 4, x=-0.5)
-    
-    
-def anova_eta2(df, ax=None):
+def anova_eta2(df, ax=None, skip_assert=False):
+    """Compute the eta^2 statistic for an ANOVA using the ranking data"""
     z = df.stack().reset_index()
     z = z.rename(columns={0: 'Rank'})
     aov = pg.anova(dv='Rank', between=['Group', 'OdorName'], data=z, detailed=True, effsize='n2').set_index('Source')
-    assert aov.loc['Group', 'n2'] < 0.0001
+    if not skip_assert:
+        assert aov.loc['Group', 'n2'] < 0.0001
     aov = aov.drop('Group')
     aov.loc['Residual', 'n2'] = 1 - aov['n2'].sum()
-    aov = aov.rename(index={'Residual': 'Individual', 'Group': 'Culture', 'OdorName': 'Odor', 'Group * OdorName': 'Culture x Odor'})
+    aov = aov.rename(index={'Residual': 'Individual', 'Group': 'Culture', 'OdorName': 'Odorant', 'Group * OdorName': 'Culture x Odorant'})
     return aov
 
 
-def get_eta2(raw_data, n_shuffles=25):
+def get_eta2(raw_data, n_shuffles=25, skip_assert=False, shuffle_types=['odors-within-culture', 'individuals']):
+    """Compute the eta^2 statistic for the real data compared with shuffled data"""
     groups = raw_data.index.unique('Group')
-    shuffle_types = ['odors-within-culture', 'individuals']
-    aov = anova_eta2(raw_data)
+    aov = anova_eta2(raw_data, skip_assert=skip_assert)
     eta2_mean = pd.DataFrame(columns=pd.Index(['raw']+shuffle_types, name='Shuffle Type'))
     eta2_sd = pd.DataFrame(columns=eta2_mean.columns)
     eta2_mean['raw'] = aov['n2']
@@ -562,56 +567,55 @@ def get_eta2(raw_data, n_shuffles=25):
         for i in trange(n_shuffles, leave=False):
             key = 'shuffle-%s' % shuffle_type
             shuffled_data = shuffle_data(raw_data, groups, shuffle_type, random_state=i)
-            aov = anova_eta2(shuffled_data)
+            aov = anova_eta2(shuffled_data, skip_assert=skip_assert)
             eta2_vals.loc[i] = aov['n2']
         eta2_mean[shuffle_type] = eta2_vals.mean()
         eta2_sd[shuffle_type] = eta2_vals.std()
     return eta2_mean, eta2_sd
 
 
-def fig_eta2(eta2_mean, eta2_sd, simplify=False, colors = ['lightgreen', 'mediumpurple', 'sandybrown'], direction='h'):
+def fig_eta2(eta2_mean, eta2_sd, kind='raw', order=['Culture x Odorant', 'Individual', 'Odorant'],
+             colors=['lightgreen', 'mediumpurple', 'sandybrown'], direction='h', ax=None):
     """A figure for showing eta^2 for the various ANOVA model factors."""
-    maxx = eta2_mean.max().max()*1.1
-    if simplify:
-        eta2_mean = eta2_mean['raw']
-        eta2_sd = eta2_sd['raw']    
-        labels = ['']
-        figsize = (7, 3) if direction =='h' else (5, 9)
-    else:
-        labels = ['Individual', 'Culture', 'Odor']
-        figsize = (15, 5) if direction =='h' else (3, 9)
-    #sns.set(font_scale=1.4)
-    #sns.set_style('whitegrid')
-    plt.figure(figsize=figsize)
     if direction == 'h':
-        ax = eta2_mean.T.plot.barh(color=colors, yerr=eta2_sd.T, ax=plt.gca())
-        ax.set_xlabel('$\eta^2$');
+        order = order[::-1]
+        colors = colors[::-1]
+    eta2_mean = eta2_mean.loc[order]
+    eta2_sd = eta2_sd.loc[order]
+    
+    maxx = eta2_mean.max().max()*1.1
+    eta2_mean = eta2_mean[kind]
+    eta2_sd = eta2_sd[kind]    
+    labels = ['']
+    if ax is None:
+        figsize = (7, 3) if direction =='h' else (5, 9)
+        plt.figure(figsize=figsize)
+        ax = plt.gca()
+    if direction == 'h':
+        ax = eta2_mean.T.plot.barh(color=colors, yerr=eta2_sd.T, ax=ax)
+        ax.set_xlabel('Proportion of variance ($\eta^2$)');
         ax.set_ylabel('')
+        ax.set_yticklabels(x.get_text().split(' x ')[0] for x in ax.get_yticklabels())
     else:
-        ax = eta2_mean.T.plot.bar(color=colors, yerr=eta2_sd.T, ax=plt.gca())
-        ax.set_ylabel('$\eta^2$');
+        ax = eta2_mean.T.plot.bar(color=colors, yerr=eta2_sd.T, ax=ax)
+        ax.set_ylabel('Proportion of variance ($\eta^2$)');
         ax.set_xlabel('')
-    if simplify:
-        if direction == 'h':
-            ax.set_yticklabels(x.get_text().split(' x ')[0] for x in ax.get_yticklabels())
-        else:
-            ax.set_xticklabels(x.get_text().split(' x ')[0] for x in ax.get_xticklabels())
-    else:
-        labels = ['No shuffle', 'Shuffle odors within cultures', 'Shuffle culture labels across individuals']
-        if direction == 'h':
-            ax.set_yticklabels(labels)
-        else:
-            ax.set_xticklabels(labels)
+        ax.set_xticklabels(x.get_text().split(' x ')[0] for x in ax.get_xticklabels())
+    title = {'raw': 'Observed Data',
+             'odors-within-culture': 'Postive Control:\nShuffle odorants within cultures',
+             'individuals': 'Negative Control:\nShuffle culture labels across individuals'}[kind]
+    ax.set_title(title, fontsize='larger')
     if direction == 'h':
         ax.set_xlim(0, maxx)
     else:
         ax.set_ylim(0, maxx)
-    if not simplify:
-        l = ax.legend(loc=(0.86, 0.2), fontsize=14)
-        _ = [old_label.set_text(labels[i]) for i, old_label in enumerate(l.get_texts())]
+    #if not simplify:
+    #    l = ax.legend(loc=(0.86, 0.2), fontsize=14)
+    #    _ = [old_label.set_text(labels[i]) for i, old_label in enumerate(l.get_texts())]
     
     
 def shuffled_variances(raw_data, odorants):
+    """Compared the variances resulting from different kinds of shuffles of the data"""
     groups = raw_data.index.unique('Group')
     variances = pd.DataFrame(0, index=odorants, columns=['total', 'across', 'within',
                                                          'total-odors-shuffle', 'across-individuals-shuffle',
@@ -634,24 +638,102 @@ def shuffled_variances(raw_data, odorants):
     variances /= n_shuffles
     return variances
 
+### End functions for ANOVA analysis
 
-def get_model_predictions(odorants):
-    # Load predictions from DREAM model
-    model_predictions = pd.read_csv('data/dream-model-prediction.csv', header=1, index_col=0).drop('CID')
+##### Begin functions for correlations between individuals #####
 
-    # Mapping between PubChem IDs and molecule names
-    cids = {379: 'Octanoic acid', 1183: 'Vanillin', 3314: 'Eugenol', 6054: '2-Phenylethanol', 6549: 'Linalool',
-            7762: 'Ethyl butyrate', 8077: 'Diethyl disulfide', 10430: 'Isovaleric acid', 18827: '1-Octen-3-ol', 32594: '2-Isobutyl-3-methoxypyrazine'}
+def compute_kendall_taus(df1, df2, model=None, **kwargs):
+    """Compute Kendall-Tau correlation for all pairs of individuals in two dataframes.
+    For example, compute Kendall-Tau correlation for ranks between individuals, and between model predictions and individuals."""
+    result = pd.DataFrame(index=df1.index, columns=df2.index)
+    for individual1 in tqdm(result.index, leave=False):
+        for individual2 in result.columns.drop(individual1, errors='ignore'):
+            x = df1.loc[individual1]
+            y = df2.loc[individual2]
+            result.loc[individual1, individual2] = kendalltau(x, y)
+    if model is not None:
+        result.loc[('Model', 1), :] = df1.apply(lambda x: kendalltau(model, x), axis=1)
+    taus = result.applymap(lambda x: x[0] if isinstance(x, tuple) else None)
+    ps = result.applymap(lambda x: x[1] if isinstance(x, tuple) else None)
+    return taus, ps
 
-    # Join model predictions with molecule names and sort
-    model_predictions.index = model_predictions.index.astype(int)
-    model_predictions = model_predictions.join(pd.Series(cids, name='Name')).set_index('Name')
-    # Use out-of-sample prediction
-    model_predictions = model_predictions.loc[odorants, 'Predicted_OUT'].rank(ascending=False).astype(int)
-    return model_predictions
+
+def fig_kendall_tau(taus, groups, direction='h'):
+    """Create the figure showing Kendall-taus correlations for various scenarios"""
+    tau_stats = pd.DataFrame(index=groups)
+    for group in groups:
+        group_data = taus.loc[group]
+        n = group_data.shape[0]
+        tau_stats.loc[group, 'Culture'] = group_data[group].mean().mean()
+        tau_stats.loc[group, 'Culture_sem'] = group_data[group].std().mean() / np.sqrt(n)
+        tau_stats.loc[group, 'Universal'] = group_data.mean().mean()
+        tau_stats.loc[group, 'Universal_sem'] = group_data.std().mean() / np.sqrt(n)
+        tau_stats.loc[group, 'Model'] = taus.loc['Model', group].mean().mean()
+        # Model is the same for every group
+        tau_stats.loc[group, 'Model_sem'] = 0#taus.loc['Model', group].std().mean() / np.sqrt(n)
+
+    sns.set(font_scale=1.5)
+    sns.set_style('white')
+    if direction == 'h':
+        fig, ax = plt.subplots(1, 2, figsize=(16, 7))
+    else:
+        fig, ax = plt.subplots(2, 1, figsize=(7, 12.5))
+    cmap = cm.get_cmap('jet')
+    norm = colors.Normalize(vmin=0, vmax=len(groups)-1)
+    for i, group in enumerate(groups):
+        tau_stats.loc[[group]].plot.scatter(x='Culture', y='Universal', xerr='Culture_sem',
+                                            yerr='Universal_sem', color=cmap(norm(i)),
+                                            label=group, s=40, alpha=0.8, ax=ax[0])
+    ax[0].plot([0, 1], [0, 1], '--')
+    ax[0].set_xlim(0, 0.6)
+    ax[0].set_ylim(0, 0.6)
+    ax[0].legend(loc=4, fontsize=11)
+    #ax[0].set_title(r'Mean Correlation $\tau$ between individual and...')
+    for i, group in enumerate(groups):
+        tau_stats.loc[[group]].plot.scatter(x='Culture', y='Model', xerr='Culture_sem',
+                                            yerr='Model_sem', color=cmap(norm(i)),
+                                            label=group, ax=ax[1], s=40, alpha=0.8)
+    ax[0].set_xlabel(r"Kendall's $\tau$ between pairs of individuals within a culture")
+    ax[0].set_ylabel(r"Kendall's $\tau$ between all individuals")
+    
+    ax[1].plot([0, 1], [0, 1], '--')
+    ax[1].set_xlim(0, 0.6)
+    ax[1].set_ylim(0, 0.6)
+    ax[1].legend(loc=4, fontsize=11)
+    #ax[1].set_title(r'Mean Correlation $\tau$ between individual and...')
+    ax[1].set_xlabel(r"Kendall's $\tau$ between pairs of individuals within a culture")
+    ax[1].set_ylabel(r"Kendall's $\tau$ between each individual and the model")
+    fig_letters(ax, 2, x=-0.15, y=1.02)
+    plt.tight_layout()
+    
+    
+def fig_highest_lowest(ranked_data, groups, odorants):
+    """Create the figure showing correlations in the highest (most pleasant)
+    and lowest (least pleasant) odors across individuals and groups"""
+    fig, ax = plt.subplots(2, 2, sharex=True, figsize=(15, 8))
+    firsts = pd.DataFrame(index=range(1, 11), columns=groups)
+    lasts = pd.DataFrame(index=range(1, 11), columns=groups)
+    for group in groups:
+        firsts[group] = ranked_data.loc[group, '1st'].value_counts()
+        lasts[group] = ranked_data.loc[group, '10th'].value_counts()
+    firsts = firsts.fillna(0)
+    lasts = lasts.fillna(0)
+    cmap = copy(cm.get_cmap('Reds'))
+    cmap.set_bad('white')
+    sns.heatmap(firsts / firsts.sum(), cmap=cmap, ax=ax[0, 0], cbar_kws={'label': 'p(first)'})
+    ax[0, 0].set_yticks(range(len(odorants)))
+    ax[0, 0].set_yticklabels(odorants, rotation=0);
+    sns.heatmap(lasts / lasts.sum(), cmap=cmap, ax=ax[0, 1], cbar_kws={'label': 'p(last)'})
+    ax[0, 1].set_yticks(range(len(odorants)))
+    ax[0, 1].set_yticklabels(odorants, rotation=0)
+    sns.heatmap(firsts.corr(), ax=ax[1, 0], cmap='RdBu_r', vmin=-1, vmax=1, cbar_kws={'label': 'r(first)'})
+    sns.heatmap(lasts.corr(), ax=ax[1, 1], cmap='RdBu_r', vmin=-1, vmax=1, cbar_kws={'label': 'r(last)'})
+    plt.tight_layout()
+    fig_letters(ax, 4, x=-0.5)
 
 
 def summarize_kt(taus, ps, ax=None):
+    """Graphically summarize the Kendall-tau correlations"""
     taus_mean = taus.astype('float').groupby('Group').mean().T.groupby('Group').mean()
     z = taus.applymap(lambda x: True if x>0 else (False if x<0 else None))
     ks = z.astype('float').groupby('Group').sum().T.groupby('Group').sum()
@@ -678,13 +760,11 @@ def summarize_kt(taus, ps, ax=None):
                      fmt='', ax=ax, cbar_kws={'shrink': .6, 'label': r'$\tau$'})
     ax.set_xlabel('')
     ax.set_ylabel('')
-    #plt.figure()
-    #ax = sns.heatmap(p_pooled.round(3), vmin=0, vmax=1, cmap='magma', annot=True, annot_kws={'fontsize': 10}, ax=ax, cbar_kws={"shrink": .6})
-    #ax.set_xlabel('')
-    #ax.set_ylabel('')
 
     
 def fig_intensity_control(taus_pi, taus_pp, taus_ii, ps_pi, ps_pp, ps_ii):
+    """Create a figure showing how the intensity data is correlated within/across cultures
+    vs. the pleasantness data, or how pleasantness and intensity are correlated with each other"""
     fig = plt.figure(figsize=(15, 15))
     widths = [16, 8]
     heights = [6, 8]
@@ -694,44 +774,51 @@ def fig_intensity_control(taus_pi, taus_pp, taus_ii, ps_pi, ps_pp, ps_ii):
     print('Pleasantness vs Intensity:')
     summarize_kt(taus_pi, ps_pi, ax=ax)
     ax.set_aspect("equal")
-    ax.set_ylabel('Intensity')
+    ax.set_ylabel('Intensity', fontsize='larger')
     ax.set_xticks(ax.get_xticks()+0.2)
     ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right', va='top')
     fig_letter(ax, 'A', x=-0.4, y=1.02)
-
-    ax = fig.add_subplot(spec[1, 0], label='pp')
-    print('Pleasantness vs Pleasantness')
-    summarize_kt(taus_pp, ps_pi, ax=ax)
-    ax.set_aspect("equal")
-    ax.set_xlabel('Pleasantness')
-    ax.set_ylabel('Pleasantness')
-    ax.set_xticks(ax.get_xticks()+0.2)
-    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right', va='top')
-    fig_letter(ax, 'B', x=-0.4, y=1.02)
 
     ax = fig.add_subplot(spec[0, 1], label='ii')
     print('Intensity vs Intensity:')
     summarize_kt(taus_ii, ps_pi, ax=ax)
     ax.set_aspect("equal")
-    ax.set_xlabel('Intensity')
+    ax.set_xlabel('Intensity', fontsize='larger')
+    ax.set_xticks(ax.get_xticks()+0.2)
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right', va='top')
+    fig_letter(ax, 'B', x=-0.4, y=1.02)
+    
+    ax = fig.add_subplot(spec[1, 0], label='pp')
+    print('Pleasantness vs Pleasantness')
+    summarize_kt(taus_pp, ps_pi, ax=ax)
+    ax.set_aspect("equal")
+    ax.set_xlabel('Pleasantness', fontsize='larger')
+    ax.set_ylabel('Pleasantness', fontsize='larger')
     ax.set_xticks(ax.get_xticks()+0.2)
     ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right', va='top')
     fig_letter(ax, 'C', x=-0.4, y=1.02)
     
     plt.tight_layout()
-
     
+##### End functions for correlations between individuals #####
+
+##### Begin utility functions for figures #####
+
 def fig_letters(axes, n, x=-0.15, y=1.02):
+    """Add letters to the figure panels"""
     for i in range(n):
         ax = axes.flat[i]
         fig_letter(ax, "ABCDEFGHIJK"[i], x=x, y=y)
         
 
 def fig_letter(ax, letter, x=-0.15, y=1.02):
+    """Add one letter to a figure panel"""
     ax.text(x,
             y,
             letter,
             transform=ax.transAxes,
             fontweight="bold",
             fontsize=18)
+    
+##### End utility functions for figures #####
         
